@@ -20,6 +20,32 @@ export interface WebLLMOptions {
   onProgress?: (progress: WebLLMProgress) => void;
 }
 
+// Logging utility for WebLLM debugging
+const LOG_PREFIX = "[WebLLM-Client]";
+
+function log(
+  level: "info" | "warn" | "error" | "debug",
+  message: string,
+  data?: unknown
+) {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] ${LOG_PREFIX} [${level.toUpperCase()}]`;
+
+  switch (level) {
+    case "error":
+      console.error(prefix, message, data !== undefined ? data : "");
+      break;
+    case "warn":
+      console.warn(prefix, message, data !== undefined ? data : "");
+      break;
+    case "debug":
+      console.debug(prefix, message, data !== undefined ? data : "");
+      break;
+    default:
+      console.log(prefix, message, data !== undefined ? data : "");
+  }
+}
+
 /**
  * Map quality hints to specific WebLLM model IDs.
  * These models are selected based on size/capability trade-offs.
@@ -39,25 +65,93 @@ export function createWebLLMModel(options: WebLLMOptions = {}) {
   const { quality = "standard", onProgress } = options;
   const modelId = QUALITY_TO_MODEL_ID[quality];
 
-  return webLLM(modelId, {
-    initProgressCallback: onProgress,
+  log("info", "Creating WebLLM model", { quality, modelId });
+  log("debug", "Model options:", {
+    quality,
+    hasProgressCallback: !!onProgress,
   });
+
+  try {
+    const model = webLLM(modelId, {
+      initProgressCallback: (progress) => {
+        log("debug", "Model init progress", {
+          modelId,
+          progress: progress.progress,
+          text: progress.text,
+        });
+        onProgress?.(progress);
+      },
+    });
+
+    log("info", "WebLLM model created successfully", { modelId });
+    return model;
+  } catch (error) {
+    log("error", "Failed to create WebLLM model", {
+      modelId,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
 }
 
 export function checkWebLLMSupport(): boolean {
-  if (typeof window === "undefined") return false;
-  return doesBrowserSupportWebLLM();
+  log("debug", "Checking WebLLM browser support...");
+
+  if (typeof window === "undefined") {
+    log("warn", "Window is undefined - likely running on server side");
+    return false;
+  }
+
+  try {
+    const supported = doesBrowserSupportWebLLM();
+    log("info", "WebLLM browser support check", {
+      supported,
+      userAgent: navigator?.userAgent?.substring(0, 100),
+      hasWebGPU: "gpu" in navigator,
+    });
+    return supported;
+  } catch (error) {
+    log("error", "Error checking WebLLM support", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
 }
 
 export async function getWebLLMAvailability(
   quality: WebLLMQuality = "standard"
 ): Promise<WebLLMAvailability> {
+  log("info", "Checking WebLLM availability", { quality });
+
   if (!checkWebLLMSupport()) {
+    log("warn", "WebLLM not supported in this browser");
     return "unavailable";
   }
+
   const modelId = QUALITY_TO_MODEL_ID[quality];
-  const model = webLLM(modelId);
-  return model.availability();
+  log("debug", "Checking availability for model", { quality, modelId });
+
+  try {
+    const model = webLLM(modelId);
+    const availability = await model.availability();
+
+    log("info", "WebLLM availability result", {
+      quality,
+      modelId,
+      availability,
+    });
+
+    return availability;
+  } catch (error) {
+    log("error", "Error checking WebLLM availability", {
+      quality,
+      modelId,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    return "unavailable";
+  }
 }
 
 export { webLLM };
