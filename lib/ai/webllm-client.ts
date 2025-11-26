@@ -4,8 +4,10 @@ import {
   doesBrowserSupportWebLLM,
   type WebLLMProgress,
   webLLM,
+  type WebLLMLanguageModel,
 } from "@built-in-ai/web-llm";
 import type { WebLLMQuality } from "./models";
+import { WebLLMChatTransport } from "./webllm-transport";
 
 export type WebLLMAvailability =
   | "unavailable"
@@ -50,7 +52,7 @@ function log(
  * Map quality hints to specific WebLLM model IDs.
  * These models are selected based on size/capability trade-offs.
  */
-const QUALITY_TO_MODEL_ID: Record<WebLLMQuality, string> = {
+export const QUALITY_TO_MODEL_ID: Record<WebLLMQuality, string> = {
   draft: "Qwen3-0.6B-q4f16_1-MLC", // Smallest, fastest
   standard: "Llama-3.2-3B-Instruct-q4f16_1-MLC", // Balanced
   high: "Qwen3-4B-q4f16_1-MLC", // Better quality
@@ -61,7 +63,7 @@ const QUALITY_TO_MODEL_ID: Record<WebLLMQuality, string> = {
  * Create a WebLLM model based on quality hint.
  * Maps quality levels to appropriate model sizes.
  */
-export function createWebLLMModel(options: WebLLMOptions = {}) {
+export function createWebLLMModel(options: WebLLMOptions = {}): WebLLMLanguageModel {
   const { quality = "standard", onProgress } = options;
   const modelId = QUALITY_TO_MODEL_ID[quality];
 
@@ -93,6 +95,23 @@ export function createWebLLMModel(options: WebLLMOptions = {}) {
     });
     throw error;
   }
+}
+
+/**
+ * Create a WebLLM chat transport for use with useChat hook.
+ * This transport runs inference entirely on the client - no server requests.
+ */
+export function createWebLLMTransport(options: WebLLMOptions = {}): WebLLMChatTransport {
+  const { quality = "standard", onProgress } = options;
+  const model = createWebLLMModel({ quality });
+
+  log("info", "Creating WebLLM transport", { quality });
+
+  return new WebLLMChatTransport({
+    model,
+    quality,
+    onProgress,
+  });
 }
 
 export function checkWebLLMSupport(): boolean {
@@ -154,4 +173,4 @@ export async function getWebLLMAvailability(
   }
 }
 
-export { webLLM };
+export { webLLM, WebLLMChatTransport };

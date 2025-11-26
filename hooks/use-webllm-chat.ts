@@ -1,16 +1,17 @@
 "use client";
 
-import { type CoreMessage, streamText } from "ai";
-import { useCallback, useRef, useState } from "react";
+import { useChat } from "@ai-sdk/react";
+import type { UIMessage } from "ai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { WebLLMQuality } from "@/lib/ai/models";
 import {
-  createWebLLMModel,
+  checkWebLLMSupport,
+  createWebLLMTransport,
   getWebLLMAvailability,
   type WebLLMAvailability,
   type WebLLMProgress,
 } from "@/lib/ai/webllm-client";
 import type { ChatMessage } from "@/lib/types";
-import { generateUUID } from "@/lib/utils";
 
 // Logging utility for WebLLM chat hook
 const LOG_PREFIX = "[WebLLM-Chat]";
@@ -64,6 +65,41 @@ interface UseWebLLMChatReturn {
   error: Error | null;
 }
 
+/**
+ * Convert ChatMessage to UIMessage format for the transport
+ */
+function chatMessageToUIMessage(msg: ChatMessage): UIMessage {
+  return {
+    id: msg.id,
+    role: msg.role as "user" | "assistant",
+    parts: msg.parts
+      .filter((p) => p.type === "text")
+      .map((p) => ({
+        type: "text" as const,
+        text: (p as { type: "text"; text: string }).text,
+      })),
+  };
+}
+
+/**
+ * Convert UIMessage to ChatMessage format for the UI
+ */
+function uiMessageToChatMessage(msg: UIMessage): ChatMessage {
+  return {
+    id: msg.id,
+    role: msg.role as "user" | "assistant",
+    parts: msg.parts
+      .filter((p) => p.type === "text")
+      .map((p) => ({
+        type: "text" as const,
+        text: (p as { type: "text"; text: string }).text,
+      })),
+    metadata: {
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
 export function useWebLLMChat({
   id,
   quality = "standard",
@@ -77,176 +113,196 @@ export function useWebLLMChat({
     initialMessagesCount: initialMessages.length,
   });
 
-  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
-  const [status, setStatus] = useState<WebLLMChatStatus>("ready");
   const [modelStatus, setModelStatus] = useState<
     WebLLMAvailability | "checking" | "loading"
   >("checking");
   const [downloadProgress, setDownloadProgress] =
     useState<WebLLMProgress | null>(null);
-  const [error, setError] = useState<Error | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const [hookError, setHookError] = useState<Error | null>(null);
+  const hasCheckedAvailability = useRef(false);
+  const hasSavedMessages = useRef<Set<string>>(new Set());
 
+  // Create the WebLLM transport - memoized to prevent recreation on every render
+  const transport = useMemo(() => {
+    log("info", "Creating WebLLM transport", { quality });
+    if (!checkWebLLMSupport()) {
+      log("warn", "WebLLM not supported, transport will not be created");
+      return null;
+    }
+    return createWebLLMTransport({
+      quality,
+      onProgress: (progress) => {
+        log("debug", "Download progress", progress);
+        setDownloadProgress(progress);
+        if (progress.progress >= 1) {
+          setModelStatus("available");
+        }
+      },
+    });
+  }, [quality]);
+
+  // Convert initial messages to UIMessage format
+  const initialUIMessages = useMemo(
+    () => initialMessages.map(chatMessageToUIMessage),
+    [initialMessages]
+  );
+
+  // Use the useChat hook with our custom transport
+  const {
+    messages: uiMessages,
+    setMessages: setUIMessages,
+    sendMessage: sendUIMessage,
+    status: chatStatus,
+    stop: stopChat,
+    error: chatError,
+  } = useChat({
+    id,
+    transport: transport ?? undefined,
+    messages: initialUIMessages,
+    onFinish: ({ message }) => {
+      log("info", "Chat finished", { messageId: message.id });
+      onFinish?.();
+    },
+    onError: (error) => {
+      log("error", "Chat error", { error: error.message });
+      setHookError(error);
+      onError?.(error);
+    },
+  });
+
+  // Check WebLLM availability on mount
+  useEffect(() => {
+    if (hasCheckedAvailability.current) return;
+    hasCheckedAvailability.current = true;
+
+    const checkAvailability = async () => {
+      log("info", "Checking WebLLM availability...", { quality });
+      try {
+        const availability = await getWebLLMAvailability(quality);
+        log("info", "WebLLM availability result", { availability, quality });
+        setModelStatus(availability);
+
+        if (availability === "unavailable") {
+          const error = new Error(
+            "WebLLM is not supported in this browser. Please use a WebGPU-compatible browser like Chrome or Edge."
+          );
+          setHookError(error);
+          onError?.(error);
+        }
+      } catch (err) {
+        log("error", "Error checking availability", { err });
+        setModelStatus("unavailable");
+      }
+    };
+
+    checkAvailability();
+  }, [quality, onError]);
+
+  // Convert UI messages to ChatMessage format for the component
+  const messages = useMemo(
+    () => uiMessages.map(uiMessageToChatMessage),
+    [uiMessages]
+  );
+
+  // Map chat status to our status type
+  const status = useMemo((): WebLLMChatStatus => {
+    if (hookError || chatError) return "error";
+    if (modelStatus === "checking" || modelStatus === "loading")
+      return "loading-model";
+    if (chatStatus === "submitted") return "submitted";
+    if (chatStatus === "streaming") return "streaming";
+    return "ready";
+  }, [chatStatus, modelStatus, hookError, chatError]);
+
+  // Wrapper for setMessages that converts between formats
+  const setMessages = useCallback(
+    (
+      messagesOrUpdater:
+        | ChatMessage[]
+        | ((prev: ChatMessage[]) => ChatMessage[])
+    ) => {
+      if (typeof messagesOrUpdater === "function") {
+        setUIMessages((prev) => {
+          const prevChatMessages = prev.map(uiMessageToChatMessage);
+          const newChatMessages = messagesOrUpdater(prevChatMessages);
+          return newChatMessages.map(chatMessageToUIMessage);
+        });
+      } else {
+        setUIMessages(messagesOrUpdater.map(chatMessageToUIMessage));
+      }
+    },
+    [setUIMessages]
+  );
+
+  // Wrapper for sendMessage that converts from our format
   const sendMessage = useCallback(
-    async (message: { role: "user"; parts: ChatMessage["parts"] }) => {
+    (message: { role: "user"; parts: ChatMessage["parts"] }) => {
       log("info", "sendMessage called", {
         chatId: id,
         quality,
         messagePartsCount: message.parts.length,
       });
 
-      const userMessage: ChatMessage = {
-        id: generateUUID(),
-        role: "user",
-        parts: message.parts,
-        metadata: { createdAt: new Date().toISOString() },
-      };
-
-      log("debug", "Created user message", { messageId: userMessage.id });
-
-      setMessages((prev) => [...prev, userMessage]);
-      setStatus("loading-model");
-      setError(null);
-
-      try {
-        log("info", "Checking WebLLM availability...", { quality });
-        const availability = await getWebLLMAvailability(quality);
-        setModelStatus(availability);
-
-        log("info", "WebLLM availability result", { availability, quality });
-
-        if (availability === "unavailable") {
-          const errorMsg =
-            "WebLLM is not supported in this browser. Please use a WebGPU-compatible browser like Chrome or Edge.";
-          log("error", errorMsg, {
-            userAgent: navigator?.userAgent,
-            hasWebGPU: typeof navigator !== "undefined" && "gpu" in navigator,
-          });
-          throw new Error(errorMsg);
-        }
-
-        if (availability === "downloadable" || availability === "downloading") {
-          log("info", "Model needs to be downloaded or is downloading", {
-            availability,
-          });
-          setModelStatus("loading");
-        }
-
-        log("info", "Creating WebLLM model...", { quality });
-        const model = createWebLLMModel({
-          quality,
-          onProgress: (progress) => {
-            log("debug", "Download progress", {
-              progress: progress.progress,
-              text: progress.text,
-            });
-            setDownloadProgress(progress);
-          },
-        });
-
-        setStatus("submitted");
-        log("info", "Status set to submitted, preparing messages...");
-
-        const allMessages: CoreMessage[] = [...messages, userMessage].map(
-          (msg) => ({
-            role: msg.role as "user" | "assistant",
-            content: msg.parts
-              .filter((p) => p.type === "text")
-              .map((p) => (p as { type: "text"; text: string }).text)
-              .join("\n"),
-          })
-        );
-
-        log("debug", "Prepared messages for streaming", {
-          messageCount: allMessages.length,
-          lastMessageRole: allMessages[allMessages.length - 1]?.role,
-        });
-
-        const assistantMessageId = generateUUID();
-        const assistantMessage: ChatMessage = {
-          id: assistantMessageId,
-          role: "assistant",
-          parts: [{ type: "text", text: "" }],
-          metadata: { createdAt: new Date().toISOString() },
-        };
-
-        setMessages((prev) => [...prev, assistantMessage]);
-        setStatus("streaming");
-        setModelStatus("available");
-
-        log("info", "Starting text stream...", { assistantMessageId });
-
-        abortControllerRef.current = new AbortController();
-
-        const result = streamText({
-          model,
-          messages: allMessages,
-          abortSignal: abortControllerRef.current.signal,
-        });
-
-        let fullText = "";
-        let chunkCount = 0;
-
-        log("debug", "Consuming text stream...");
-        for await (const chunk of result.textStream) {
-          fullText += chunk;
-          chunkCount++;
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantMessageId
-                ? {
-                    ...msg,
-                    parts: [{ type: "text", text: fullText }],
-                  }
-                : msg
-            )
-          );
-        }
-
-        log("info", "Stream completed", {
-          assistantMessageId,
-          totalChunks: chunkCount,
-          totalLength: fullText.length,
-        });
-
-        log("info", "Saving WebLLM messages to server...", { chatId: id });
-        await saveWebLLMMessages(id, userMessage, {
-          ...assistantMessage,
-          parts: [{ type: "text", text: fullText }],
-        });
-
-        setStatus("ready");
-        log("info", "Message exchange completed successfully");
-        onFinish?.();
-      } catch (err) {
-        const caughtError =
-          err instanceof Error ? err : new Error("Unknown error occurred");
-
-        log("error", "Error in sendMessage", {
-          errorName: caughtError.name,
-          errorMessage: caughtError.message,
-          stack: caughtError.stack,
-          isAbortError: caughtError.name === "AbortError",
-        });
-
-        if (caughtError.name !== "AbortError") {
-          setError(caughtError);
-          setStatus("error");
-          onError?.(caughtError);
-        } else {
-          log("info", "Stream was aborted by user");
-          setStatus("ready");
-        }
+      if (modelStatus === "unavailable") {
+        const error = new Error("WebLLM is not available in this browser");
+        setHookError(error);
+        onError?.(error);
+        return;
       }
+
+      // Mark model as loading if it needs to be downloaded
+      if (modelStatus === "downloadable" || modelStatus === "downloading") {
+        setModelStatus("loading");
+      }
+
+      // Extract text content from parts
+      const textContent = message.parts
+        .filter((p): p is { type: "text"; text: string } => p.type === "text")
+        .map((p) => p.text)
+        .join("\n");
+
+      log("debug", "Sending message via useChat", { textContent });
+
+      // Send using the useChat hook - only send text parts
+      const textParts = message.parts
+        .filter((p): p is { type: "text"; text: string } => p.type === "text")
+        .map((p) => ({ type: "text" as const, text: p.text }));
+
+      sendUIMessage({
+        parts: textParts,
+      });
     },
-    [messages, id, quality, onFinish, onError]
+    [id, quality, modelStatus, sendUIMessage, onError]
   );
 
+  // Save messages to server after successful completion
+  useEffect(() => {
+    const saveMessages = async () => {
+      if (status !== "ready" || messages.length < 2) return;
+
+      // Get the last user and assistant message pair
+      const lastAssistant = messages.findLast((m) => m.role === "assistant");
+      const lastUser = messages.findLast((m) => m.role === "user");
+
+      if (!lastAssistant || !lastUser) return;
+
+      // Check if we've already saved this pair
+      const pairKey = `${lastUser.id}-${lastAssistant.id}`;
+      if (hasSavedMessages.current.has(pairKey)) return;
+      hasSavedMessages.current.add(pairKey);
+
+      log("info", "Saving WebLLM messages to server...", { chatId: id });
+      await saveWebLLMMessages(id, lastUser, lastAssistant);
+    };
+
+    saveMessages();
+  }, [status, messages, id]);
+
+  // Stop function
   const stop = useCallback(() => {
     log("info", "Stop called - aborting stream");
-    abortControllerRef.current?.abort();
-    setStatus("ready");
-  }, []);
+    stopChat();
+  }, [stopChat]);
 
   return {
     messages,
@@ -256,7 +312,7 @@ export function useWebLLMChat({
     stop,
     modelStatus,
     downloadProgress,
-    error,
+    error: hookError ?? chatError ?? null,
   };
 }
 
