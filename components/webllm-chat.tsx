@@ -19,7 +19,33 @@ import { MultimodalInput } from "./multimodal-input";
 import { getChatHistoryPaginationKey } from "./sidebar-history";
 import { toast } from "./toast";
 import type { VisibilityType } from "./visibility-selector";
-import { WebLLMStatus } from "./webllm-status";
+import { WebLLMErrorDisplay, WebLLMStatus } from "./webllm-status";
+
+// Logging utility for WebLLM Chat component
+const LOG_PREFIX = "[WebLLM-ChatComponent]";
+
+function log(
+  level: "info" | "warn" | "error" | "debug",
+  message: string,
+  data?: unknown
+) {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] ${LOG_PREFIX} [${level.toUpperCase()}]`;
+
+  switch (level) {
+    case "error":
+      console.error(prefix, message, data !== undefined ? data : "");
+      break;
+    case "warn":
+      console.warn(prefix, message, data !== undefined ? data : "");
+      break;
+    case "debug":
+      console.debug(prefix, message, data !== undefined ? data : "");
+      break;
+    default:
+      console.log(prefix, message, data !== undefined ? data : "");
+  }
+}
 
 export function WebLLMChat({
   id,
@@ -36,6 +62,13 @@ export function WebLLMChat({
   isReadonly: boolean;
   onModelChange: (modelId: string) => void;
 }) {
+  log("info", "WebLLMChat component rendering", {
+    chatId: id,
+    initialChatModel,
+    initialMessagesCount: initialMessages.length,
+    isReadonly,
+  });
+
   const { visibilityType } = useChatVisibility({
     chatId: id,
     initialVisibilityType,
@@ -47,6 +80,7 @@ export function WebLLMChat({
 
   // Extract quality hint from the model ID
   const quality = getWebLLMQuality(currentModelId);
+  log("debug", "Quality determined from model ID", { currentModelId, quality });
 
   const {
     messages,
@@ -62,15 +96,29 @@ export function WebLLMChat({
     quality,
     initialMessages,
     onFinish: () => {
+      log("info", "WebLLM chat finished successfully");
       mutate(unstable_serialize(getChatHistoryPaginationKey));
     },
     onError: (err) => {
+      log("error", "WebLLM chat error", {
+        errorMessage: err.message,
+        errorStack: err.stack,
+      });
       toast({
         type: "error",
         description: err.message,
       });
     },
   });
+
+  // Log status changes
+  useEffect(() => {
+    log("debug", "WebLLM status changed", {
+      status,
+      modelStatus,
+      error: error?.message,
+    });
+  }, [status, modelStatus, error]);
 
   const searchParams = useSearchParams();
   const query = searchParams.get("query");
@@ -98,6 +146,10 @@ export function WebLLMChat({
   const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
 
   const handleModelChange = (modelId: string) => {
+    log("info", "Model change requested", {
+      from: currentModelId,
+      to: modelId,
+    });
     setCurrentModelId(modelId);
     onModelChange(modelId);
   };
@@ -152,13 +204,16 @@ export function WebLLMChat({
           />
         </div>
 
-        {error && (
-          <div className="mx-auto w-full max-w-4xl px-4 pt-2">
-            <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-destructive text-sm">
-              {error.message}
-            </div>
-          </div>
-        )}
+        <div className="mx-auto w-full max-w-4xl px-4 pt-2">
+          <WebLLMErrorDisplay
+            error={error}
+            onRetry={() => {
+              log("info", "User requested retry after error");
+              // Reload the page to reset state and retry
+              window.location.reload();
+            }}
+          />
+        </div>
 
         <Messages
           chatId={id}
